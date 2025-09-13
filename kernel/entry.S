@@ -10,9 +10,18 @@ _entry:
     bnez a0, park        # 如果不是hart 0，跳转到park
 
     # 第一个调试检查点
-    li t0, 0x10000000    # UART基地址
+1:  li t0, 0x10000000    # UART基地址
+    lb t1, 5(t0)         # 读取LSR状态寄存器
+    andi t1, t1, 0x20    # 检查THR是否为空
+    beqz t1, 1b          # 如果THR不为空，继续等待
+    
     li t1, 'S'           # 启动标记
-    sb t1, 0(t0)        # 输出字符S表示启动
+    sb t1, 0(t0)         # 输出字符S
+    
+    # 等待一小段时间
+    li t2, 1000
+1:  addi t2, t2, -1
+    bnez t2, 1b
 
     # 设置栈指针
     la sp, _stack_top    # 加载栈顶地址
@@ -23,8 +32,21 @@ _entry:
     call clear_bss       # 调用清零函数
 
     # 第二个调试检查点
+1:  lb t1, 5(t0)         # 读取LSR状态寄存器
+    andi t1, t1, 0x20    # 检查THR是否为空
+    beqz t1, 1b          # 如果THR不为空，继续等待
+    
     li t1, 'P'           # 栈设置完成标记
-    sb t1, 0(t0)        # 输出字符P表示栈设置完成
+    sb t1, 0(t0)         # 输出字符P
+    
+    # 输出换行符
+    li t1, '\n'          # 换行符
+    sb t1, 0(t0)         # 输出换行
+
+    # 等待一小段时间
+    li t2, 1000
+1:  addi t2, t2, -1
+    bnez t2, 1b
 
     # 跳转到C代码
     tail start           # 跳转到start函数

@@ -1,6 +1,13 @@
 OUTPUT_ARCH("riscv")
 ENTRY(_entry)
 
+PHDRS
+{
+    text PT_LOAD FLAGS(5);     /* 代码段：可读(4)+可执行(1) */
+    rodata PT_LOAD FLAGS(4);   /* 只读数据：可读(4) */
+    data PT_LOAD FLAGS(6);     /* 数据段：可读(4)+可写(2) */
+}
+
 SECTIONS
 {
     /* 内核加载地址 */
@@ -9,11 +16,11 @@ SECTIONS
     .text : {
         *(.text.entry)   /* 入口代码段 */
         *(.text .text.*) /* 其他代码段 */
-    }
+    } :text
 
     .rodata : {
         *(.rodata .rodata.*) /* 只读数据段 */
-    }
+    } :rodata
 
     .data : {
         *(.data .data.*) /* 数据段 */

@@ -13,8 +13,8 @@ CFLAGS = -Wall -O2 -ffreestanding -nostdlib -nostdinc -mcmodel=medany
 LDFLAGS = -T kernel/kernel.ld
 
 # 源文件
-ASM_SRCS = $(wildcard kernel/boot/*.S)
-C_SRCS = $(wildcard kernel/boot/*.c)
+ASM_SRCS = kernel/entry.S
+C_SRCS = kernel/start.c kernel/main.c kernel/uart.c
 OBJS = $(ASM_SRCS:.S=.o) $(C_SRCS:.c=.o)
 
 # 目标文件

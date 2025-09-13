@@ -1,19 +1,20 @@
+typedef unsigned char uint8_t;
 extern void main(void);
 
-#define UART0 0x10000000
+#define UART0_BASE 0x10000000ULL
 #define UART_THR 0x00    // 发送保持寄存器
 #define UART_LSR 0x05    // 线状态寄存器
 #define UART_LSR_EMPTY_MASK 0x40  // 发送保持寄存器空标志位
 
 // 写入UART寄存器
 static inline void uart_write_reg(int reg, char c) {
-    volatile char *p = (volatile char *)(UART0 + reg);
+    volatile uint8_t *p = (volatile uint8_t *)(UART0_BASE + reg);
     *p = c;
 }
 
 // 读取UART寄存器
 static inline char uart_read_reg(int reg) {
-    volatile char *p = (volatile char *)(UART0 + reg);
+    volatile uint8_t *p = (volatile uint8_t *)(UART0_BASE + reg);
     return *p;
 }
 
