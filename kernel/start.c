@@ -1,3 +1,4 @@
+#include "types.h"
 typedef unsigned char uint8_t;
 extern void main(void);
 

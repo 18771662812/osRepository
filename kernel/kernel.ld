@@ -25,7 +25,7 @@ SECTIONS
     .data : {
         *(.data .data.*) /* 数据段 */
         . = ALIGN(4096);
-        _stack_bottom = .;
+        _stack0 = .;
         . += 4096;      /* 设置4KB 栈空间 */
         _stack_top = .;
     }

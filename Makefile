@@ -14,7 +14,7 @@ LDFLAGS = -T kernel/kernel.ld
 
 # 源文件
 ASM_SRCS = kernel/entry.S
-C_SRCS = kernel/start.c kernel/main.c kernel/uart.c
+C_SRCS = kernel/start.c kernel/main.c kernel/uart.c kernel/printf.c kernel/console.c
 OBJS = $(ASM_SRCS:.S=.o) $(C_SRCS:.c=.o)
 
 # 目标文件
@@ -39,7 +39,7 @@ $(KERNEL): $(OBJS)
 
 # 使用QEMU运行
 qemu: $(KERNEL)
-	qemu-system-riscv64 -machine virt -kernel $(KERNEL) -nographic
+	qemu-system-riscv64 -machine virt -nographic -kernel kernel.elf -bios none
 
 # 清理
 clean:

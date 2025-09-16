@@ -1,4 +1,5 @@
 #include "uart.h"
+#include "types.h"
 
 // UART寄存器定义
 #define UART_THR 0x10000000   // 发送保持寄存器（写入要发送的数据）
