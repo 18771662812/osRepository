@@ -19,11 +19,6 @@ static inline char uart_read_reg(int reg) {
     return *p;
 }
 
-// 初始化UART
-static void uart_init() {
-    // 简单起见，假设QEMU已经初始化了大部分UART配置
-    // 在实际硬件上需要配置波特率等参数
-}
 
 // 通过UART发送字符
 static void uart_putc(char c) {
@@ -35,8 +30,6 @@ static void uart_putc(char c) {
 
 // 启动函数
 void start() {
-    // 初始化UART
-    uart_init();
     
     // 输出启动信息
     const char *msg = "RISC-V OS Starting...\n";

@@ -14,7 +14,7 @@ LDFLAGS = -T kernel/kernel.ld
 
 # 源文件
 ASM_SRCS = kernel/entry.S
-C_SRCS = kernel/start.c kernel/main.c kernel/uart.c kernel/printf.c kernel/console.c
+C_SRCS = kernel/start.c kernel/main.c kernel/uart.c kernel/printf.c kernel/console.c kernel/pmm.c kernel/vm.c
 OBJS = $(ASM_SRCS:.S=.o) $(C_SRCS:.c=.o)
 
 # 目标文件

@@ -14,8 +14,10 @@ SECTIONS
     . = 0x80000000;
 
     .text : {
+        _text_start = .;
         *(.text.entry)   /* 入口代码段 */
         *(.text .text.*) /* 其他代码段 */
+        _text_end = .;
     } :text
 
     .rodata : {
@@ -23,6 +25,7 @@ SECTIONS
     } :rodata
 
     .data : {
+        _data_start = .;
         *(.data .data.*) /* 数据段 */
         . = ALIGN(4096);
         _stack0 = .;

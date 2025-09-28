@@ -1,6 +1,5 @@
 #include "uart.h"
 
-// 方案1：使用ANSI转义序列清屏
 void clear_screen(void) {
     // ESC [ 2 J - 清除整个屏幕
     uart_putc(0x1B);    // ESC

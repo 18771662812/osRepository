@@ -12,9 +12,7 @@
 void uart_putc(char c) {
     // 等待直到发送保持寄存器为空
     // 这里检查LSR的THRE位，该位为1表示THR为空，可以发送新的数据
-    while((*((volatile unsigned char*)UART_LSR) & LSR_THRE) == 0)
-        ;
-    
+    while((*((volatile unsigned char*)UART_LSR) & LSR_THRE) == 0);
     // 向THR写入要发送的字符
     *((volatile unsigned char*)UART_THR) = c;
 }
