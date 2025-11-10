@@ -59,16 +59,12 @@ static pte_t* walk_inner(uint64 pt_pa, uint64 va, int alloc) {
 	return &l0[VPN_MASK(va, 0)];
 }
 
-pte_t* walk_create(pagetable_t pt, uint64 va) {
-	return walk_inner((uint64)pt, va, 1);
-}
-
-pte_t* walk_lookup(pagetable_t pt, uint64 va) {
-	return walk_inner((uint64)pt, va, 0);
-}
+// Exported helpers
+pte_t* walk_create(pagetable_t pt, uint64 va) { return walk_inner((uint64)pt, va, 1); }
+pte_t* walk_lookup(pagetable_t pt, uint64 va) { return walk_inner((uint64)pt, va, 0); }
 
 int map_page(pagetable_t pt, uint64 va, uint64 pa, int perm) {
-	pte_t *pte = walk_create(pt, va);
+	pte_t *pte = walk_inner(pt, va, 1);
 	if (!pte) return -1;
 	if (*pte & PTE_V) {
 		// remap is an error in this simple version

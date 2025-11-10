@@ -4,6 +4,27 @@
 // 声明uart_putc函数
 extern void uart_putc(char);
 
+// forward declaration for printf so panic can call it
+extern int printf(char *fmt, ...);
+
+// panic 状态标志，模仿 xv6
+volatile int panicking = 0; // 正在打印 panic 信息
+volatile int panicked = 0;  // 已进入 panic 的状态
+
+// panic 实现：打印信息并挂起
+void panic(char *s) {
+  // 如果已经在 panic 中，避免递归打印
+  if (panicking) {
+    panicked = 1;
+    while (1) __asm__ volatile("wfi");
+  }
+  panicking = 1;
+  printf("panic: %s\n", s);
+  panicked = 1;
+  // 永久挂起
+  while (1) __asm__ volatile("wfi");
+}
+
 static char digits[] = "0123456789abcdef";
 
 // 输出单个字符

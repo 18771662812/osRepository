@@ -48,8 +48,7 @@ pagetable_t create_pagetable(void);
 int map_page(pagetable_t pt, uint64 va, uint64 pa, int perm);
 void destroy_pagetable(pagetable_t pt);
 void dump_pagetable(pagetable_t pt, int level);
-
-// Internal helpers
+// Internal walking helpers (exposed for tests)
 pte_t* walk_create(pagetable_t pt, uint64 va);
 pte_t* walk_lookup(pagetable_t pt, uint64 va);
 

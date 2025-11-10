@@ -16,6 +16,10 @@ typedef unsigned long size_t;
 // 全局物理内存管理器实例
 struct pmm pmm_manager = {0};
 
+// 位图：用于跟踪已分配的物理页（1 = 已分配，0 = 空闲）
+unsigned char *pmm_bitmap = NULL;
+uint64_t pmm_bitmap_bytes = 0;
+
 
 // 简单的memset实现
 static void memset(void* ptr, int value, size_t size) {
@@ -30,6 +34,53 @@ static uint64_t detect_memory_size(void) {
     // QEMU virt机器默认有128MB内存
     // 实际项目中应该从设备树或BIOS获取
     return 128 * 1024 * 1024; // 128MB
+}
+
+// ---------------- 位图辅助函数 ----------------
+void bitmap_init(void) {
+    uint64_t total_pages = pmm_manager.total_pages;
+    pmm_bitmap_bytes = (total_pages + 7) / 8;
+
+    // 尝试将位图放在 kernel_end 之后，或者从空闲链表中分配。
+    // 为简化处理，使用从 mem_start 开始的第一个空闲页作为位图存储。
+    // 我们从 freelist 弹出一页作为位图存储，并将其标记为已使用。
+    void *bmp_page = NULL;
+    if (pmm_manager.freelist) {
+        bmp_page = pmm_manager.freelist;
+        // remove one page from freelist
+        pmm_manager.freelist = ((struct run*)bmp_page)->next;
+        pmm_manager.free_pages--;
+        pmm_manager.used_pages++;
+    }
+
+    if (bmp_page) {
+        pmm_bitmap = (unsigned char*)bmp_page;
+        // clear entire bitmap buffer
+        memset(pmm_bitmap, 0, pmm_bitmap_bytes);
+    } else {
+        // fallback: no free page to store bitmap; set pointer NULL
+        pmm_bitmap = NULL;
+        pmm_bitmap_bytes = 0;
+    }
+}
+
+void bitmap_set_pfn(uint64_t pfn) {
+    if (!pmm_bitmap) return;
+    uint64_t idx = pfn >> 3;
+    uint8_t bit = pfn & 7;
+    pmm_bitmap[idx] |= (1 << bit);
+}
+void bitmap_clear_pfn(uint64_t pfn) {
+    if (!pmm_bitmap) return;
+    uint64_t idx = pfn >> 3;
+    uint8_t bit = pfn & 7;
+    pmm_bitmap[idx] &= ~(1 << bit);
+}
+int bitmap_test_pfn(uint64_t pfn) {
+    if (!pmm_bitmap) return 0;
+    uint64_t idx = pfn >> 3;
+    uint8_t bit = pfn & 7;
+    return (pmm_bitmap[idx] >> bit) & 1;
 }
 
 // 初始化物理内存管理器
@@ -69,11 +120,22 @@ void pmm_init(void) {
         pmm_manager.free_pages++;
     }
     
+    // 初始化位图（在建立完 freelist 后）
+    bitmap_init();
+
+    // 标记保留区域（kernel 之前的区域）为已分配
+    // free_start 之前的页面视为保留页
+    uint64_t reserved_pages = (free_start - pmm_manager.mem_start) / PAGE_SIZE;
+    for (uint64_t pfn = 0; pfn < reserved_pages; pfn++) {
+        bitmap_set_pfn(pfn);
+        // these reserved pages are not on freelist and should count as used
+        pmm_manager.used_pages++;
+    }
+
+    // 对于已经在 freelist 上的页面，确保位图位为 0（空闲）
+    // 注意：我们之前已经为位图存储移除过一页，并将其计为已使用。
     // 输出初始化信息
-    printf("Physical Memory Manager initialized:\n");
-    printf("  Total memory: 128MB\n");
-    printf("  Total pages: %llu\n", pmm_manager.total_pages);
-    printf("  Free pages: %llu\n", pmm_manager.free_pages);
+    
 }
 
 // 分配一个物理页
@@ -89,6 +151,9 @@ void* alloc_page(void) {
     
     pmm_manager.free_pages--;
     pmm_manager.used_pages++;
+    // mark bitmap allocated
+    uint64_t pfn = page_to_pfn((void*)r);
+    bitmap_set_pfn(pfn);
     
     // 清零页面内容
     memset(r, 0, PAGE_SIZE);
@@ -122,6 +187,9 @@ void free_page(void* page) {
     
     pmm_manager.free_pages++;
     pmm_manager.used_pages--;
+    // clear bitmap
+    uint64_t pfn = page_to_pfn(page);
+    bitmap_clear_pfn(pfn);
 }
 
 // 分配连续的n个页面

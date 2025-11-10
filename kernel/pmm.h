@@ -41,6 +41,17 @@ uint64_t get_free_pages(void);            // 获取空闲页面数
 uint64_t get_used_pages(void);            // 获取已用页面数
 void pmm_info(void);                      // 打印内存管理信息
 
+// 位图：用于跟踪物理页的分配状态
+// 每一位对应一个物理页（PFN）。1 表示已分配，0 表示空闲。
+extern unsigned char *pmm_bitmap;         // 指向位图内存的指针
+extern uint64_t pmm_bitmap_bytes;         // 位图占用的字节数
+
+// Bitmap helpers
+void bitmap_init(void);
+void bitmap_set_pfn(uint64_t pfn);
+void bitmap_clear_pfn(uint64_t pfn);
+int  bitmap_test_pfn(uint64_t pfn);
+
 // 辅助函数
 static inline uint64_t align_page(uint64_t addr) {
     return (addr + PAGE_SIZE - 1) & PAGE_MASK;
@@ -52,6 +63,15 @@ static inline uint64_t page_to_pfn(void* page) {
 
 static inline void* pfn_to_page(uint64_t pfn) {
     return (void*)(pmm_manager.mem_start + (pfn << PAGE_SHIFT));
+}
+
+// Convenience: check whether a physical page (address) is allocated
+static inline int pmm_is_allocated(void *page) {
+    if (!page) return 0;
+    uint64_t addr = (uint64_t)page;
+    if (addr < pmm_manager.mem_start || addr >= pmm_manager.mem_end) return 0;
+    uint64_t pfn = page_to_pfn(page);
+    return bitmap_test_pfn(pfn);
 }
 
 #endif // PMM_H

@@ -16,10 +16,6 @@ _entry:
     la a0, _bss_start    # bss段起始地址
     la a1, _bss_end      # bss段结束地址
     call clear_bss       # 调用清零函数
-    
-    # 输出换行符
-    li t1, '\n'          # 换行符
-    sb t1, 0(t0)         # 输出换行
 
     # 跳转到C代码
     tail start           # 跳转到start函数
