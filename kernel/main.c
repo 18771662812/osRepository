@@ -5,32 +5,15 @@
 #include "trap.h"
 #include "sbi.h"
 #include "proc.h"
+#include "timer.h"
+#include "semaphore.h"
 
 #ifndef NULL
 #define NULL ((void*)0)
 #endif
 
-// 测试使用的外部计数器
-extern volatile uint64_t ticks;
-
-// 定时器初始化函数原型
-extern void timer_init(void);
-
-// 函数声明
 extern int printf(char *fmt, ...);
 
-void assert(int condition) {
-	if (!condition) {
-		printf("ASSERTION FAILED!\n");
-		while(1) { // 死循环，停止执行
-			__asm__ volatile("wfi");
-		}
-	}
-}
-
-
-
-// --------- 测试支撑与示例任务 ---------
 static inline void msleep(uint64 ms) {
     // 假设 timebase ~10MHz，则1ms≈10,000 cycles
     const uint64 cycles_per_ms = 10000ULL;
@@ -41,26 +24,19 @@ static inline void msleep(uint64 ms) {
     }
 }
 
-static int create_process(void (*fn)(void)) {
-    // 适配已有内核进程创建 API
-    extern int kproc_create(void (*fn)(void *), void *arg, const char *name);
+static void kproc_trampoline(void *arg) {
+    void (*fn)(void) = (void (*)(void))arg;
+    fn();
+}
+
+static int spawn_process(void (*fn)(void)) {
     static int seq = 0; char name[16];
     int n = seq++; if (n > 9999) n = 0;
     int i=0; name[i++]='p'; name[i++]='r'; name[i++]='o'; name[i++]='c'; name[i++]='-';
     name[i++] = '0' + (n/1000)%10; name[i++] = '0' + (n/100)%10; name[i++]='0'+(n/10)%10; name[i++]='0'+(n%10); name[i]=0;
-    // 包装无参函数为有参签名
-    void trampoline(void *x) { (void)x; fn(); }
-    return kproc_create(trampoline, 0, name);
+    return kproc_create(kproc_trampoline, (void*)fn, name);
 }
 
-static void wait_process(void *unused) { (void)unused; msleep(200); }
-
-// 简单任务：打印后结束
-static void simple_task(void) {
-    printf("simple_task running\n");
-}
-
-// 计算密集任务：做一些无意义计算并周期性让出
 static void cpu_intensive_task(void) {
     volatile uint64 sum = 0;
     for (int i = 0; i < 50000; i++) {
@@ -71,83 +47,97 @@ static void cpu_intensive_task(void) {
     printf("CPU intensive task completed\n");
 }
 
-// 生产者-消费者示例
-static int buf_has = 0;
-static int buf_value = 0;
-static void *chan_empty = (void*)1;
-static void *chan_full  = (void*)2;
-
-static void shared_buffer_init(void) {
-    buf_has = 0; buf_value = 0;
-}
-
-static void producer_task(void) {
-    for (int i = 1; i <= 10; i++) {
-        while (buf_has) {
-            sleep(chan_empty);
-        }
-        buf_value = i;
-        buf_has = 1;
-        wakeup(chan_full);
-        yield();
-    }
-}
-
-static void consumer_task(void) {
-    for (int i = 1; i <= 10; i++) {
-        while (!buf_has) {
-            sleep(chan_full);
-        }
-        int v = buf_value; (void)v;
-        buf_has = 0;
-        wakeup(chan_empty);
-        yield();
-    }
-}
-
-// --------- 测试集 ---------
-static void test_process_creation(void) {
-    printf("Testing process creation...\n");
-    int pid = create_process(simple_task);
-    assert(pid > 0);
-
-    int count = 0;
-    for (int i = 0; i < NPROC + 5; i++) {
-        int pid2 = create_process(simple_task);
-        if (pid2 > 0) count++; else break;
-    }
-    printf("Created %d processes\n", count);
-    for (int i = 0; i < count; i++) wait_process(NULL);
-}
-
-static void test_scheduler(void) {
+static void run_scheduler_test(void *arg) {
+    (void)arg;
     printf("Testing scheduler...\n");
-    for (int i = 0; i < 3; i++) create_process(cpu_intensive_task);
+    for (int i = 0; i < 3; i++) spawn_process(cpu_intensive_task);
     uint64 start_time = get_time();
     msleep(1000);
     uint64 end_time = get_time();
     printf("Scheduler test completed in %lu cycles\n", end_time - start_time);
-}
-
-static void test_synchronization(void) {
-    shared_buffer_init();
-    create_process(producer_task);
-    create_process(consumer_task);
-    wait_process(NULL);
-    wait_process(NULL);
-    printf("Synchronization test completed\n");
-}
-
-static void run_process_creation_only(void *arg) {
-    (void)arg;
-    test_process_creation();
-    printf("Process creation test finished.\n");
-}
-
-static void run_scheduler_test(void *arg) {
-    (void)arg;
-    test_scheduler();
     printf("Scheduler test finished.\n");
+    debug_proc_table();
+}
+
+static void info_task(void) {
+    printf("info_task running\n");
+    yield();
+}
+
+static void run_creation_test(void *arg) {
+    (void)arg;
+    printf("Testing bulk process creation...\n");
+    for (int i = 0; i < 10; i++) {
+        if (spawn_process(info_task) < 0) {
+            printf("spawn process %d failed\n", i);
+            break;
+        }
+    }
+    msleep(200);
+    debug_proc_table();
+    printf("Bulk creation test finished.\n");
+}
+
+#define PC_BUFFER_SIZE 4
+#define PC_ITEMS 10
+static struct semaphore sem_empty;
+static struct semaphore sem_full;
+static struct semaphore sem_mutex;
+static struct semaphore sem_done;
+static int pc_buffer[PC_BUFFER_SIZE];
+static int pc_head = 0;
+static int pc_tail = 0;
+
+static void pc_init(void) {
+    sem_init(&sem_empty, PC_BUFFER_SIZE, "pc_empty");
+    sem_init(&sem_full, 0, "pc_full");
+    sem_init(&sem_mutex, 1, "pc_mutex");
+    sem_init(&sem_done, 0, "pc_done");
+    pc_head = pc_tail = 0;
+}
+
+static void producer_task(void) {
+    for (int item = 1; item <= PC_ITEMS; item++) {
+        sem_wait(&sem_empty);
+        sem_wait(&sem_mutex);
+        pc_buffer[pc_tail] = item;
+        pc_tail = (pc_tail + 1) % PC_BUFFER_SIZE;
+        printf("[producer] item %d\n", item);
+        sem_signal(&sem_mutex);
+        sem_signal(&sem_full);
+        yield();
+    }
+    printf("[producer] done\n");
+}
+
+static void consumer_task(void) {
+    for (int i = 1; i <= PC_ITEMS; i++) {
+        sem_wait(&sem_full);
+        sem_wait(&sem_mutex);
+        int value = pc_buffer[pc_head];
+        pc_head = (pc_head + 1) % PC_BUFFER_SIZE;
+        printf("[consumer] got %d\n", value);
+        sem_signal(&sem_mutex);
+        sem_signal(&sem_empty);
+        yield();
+    }
+    printf("[consumer] done\n");
+    sem_signal(&sem_done);
+}
+
+static void run_sync_test(void *arg) {
+    (void)arg;
+    printf("Testing producer-consumer synchronization...\n");
+    pc_init();
+    int prod = spawn_process(producer_task);
+    int cons = spawn_process(consumer_task);
+    if (prod < 0 || cons < 0) {
+        printf("Failed to spawn producer/consumer (prod=%d cons=%d)\n", prod, cons);
+        return;
+    }
+    printf("Spawned producer PID=%d consumer PID=%d\n", prod, cons);
+    sem_wait(&sem_done);
+    printf("Producer-consumer test finished.\n");
 }
 
 void main() {
@@ -158,12 +148,15 @@ void main() {
     kvminit();
     
     trap_init();
+    timer_init();
     
     
     // 初始化进程与调度器
     proc_init();
-    // 启动：运行调度器测试
+    // 启动：运行调度器与同步测试
     kproc_create(run_scheduler_test, 0, "test-scheduler");
+    kproc_create(run_sync_test, 0, "test-sync");
+    kproc_create(run_creation_test, 0, "test-create");
     // 进入调度器（不返回）
     scheduler();
 }

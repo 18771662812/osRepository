@@ -3,8 +3,9 @@
 
 #include "types.h"
 #include "pmm.h"
+#include "spinlock.h"
 
-#define NPROC 16
+#define NPROC 64
 #define KSTACK_SIZE KERNEL_STACK_SIZE
 
 // 进程状态
@@ -63,6 +64,12 @@ struct proc {
     int time_slice;
     int need_resched;
     void *chan;      // sleep/wakeup 使用的等待通道
+    int qlevel;
+    uint64 last_run_tick;
+    uint64 last_ready_tick;
+    struct proc *parent;
+    int child_count;
+    int exit_status;
 
     // 用户态相关（占位）
     struct trapframe *tf;
@@ -74,21 +81,26 @@ extern struct proc *current;
 
 // 进程/调度 API
 void proc_init(void);
-struct proc* allocproc(void);
+struct proc* alloc_process(void);
+void free_process(struct proc *p);
+int create_process(void (*entry)(void));
+void exit_process(int status);
+int wait_process(int *status);
 void scheduler(void);
 void yield(void);
 void sched(void);
 
 // 同步原语：基于通道的睡眠/唤醒（简化版，禁中断避免 lost wakeup）
-void sleep(void *chan);
+void sleep(void *chan, struct spinlock *lk);
 void wakeup(void *chan);
 
 // 创建内核线程用于演示
 int kproc_create(void (*fn)(void *), void *arg, const char *name);
 
+// 调试辅助：打印进程表
+void debug_proc_table(void);
+
 // 由汇编实现
 void swtch(struct context *old, struct context *new);
 
 #endif // PROC_H
-
-

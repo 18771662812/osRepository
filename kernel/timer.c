@@ -1,12 +1,15 @@
 /* 定时器处理：timer_interrupt 实现及初始化 */
-#include "types.h"
+#include "timer.h"
 #include "sbi.h"
 #include "trap.h"
+#include "types.h"
 #include "uart.h"
 
 extern int printf(char *fmt, ...);
 
-// 简单的系统节拍计数
+// 约 100ms（10MHz timebase）间隔
+#define TIMER_INTERVAL 1000000ULL
+
 // 简单的系统节拍计数
 static volatile uint64_t sys_ticks = 0;
 
@@ -15,17 +18,27 @@ volatile int timer_interrupt_count = 0;
 
 // 定时器中断处理由 trap.c::clockintr 统一完成，这里仅维护本地计数供测试
 void timer_interrupt(void *arg) {
+    (void)arg;
     sys_ticks++;
     timer_interrupt_count++;
 }
 
-// 对外初始化：注册 timer handler 并设置首次定时器
+static uint64_t program_next_tick(void) {
+    uint64_t now = get_time();
+    uint64_t next = now + TIMER_INTERVAL;
+    __asm__ volatile("csrw 0x14D, %0" :: "r" (next));
+    return next;
+}
+
+void timer_schedule_next_tick(void) {
+    program_next_tick();
+}
+
+// 对外初始化：设置首次定时器
 void timer_init(void) {
     // 设定首次定时器
-    uint64_t now = get_time();
-    const uint64_t interval = 1000000ULL;
-    sbi_set_timer(now + interval);
-    printf("timer: first tick scheduled at %llu\n", now + interval);
+    uint64_t next = program_next_tick();
+    printf("timer: first tick scheduled at %llu\n", next);
 }
 
 // 获取系统节拍数（供调试使用）

@@ -2,6 +2,7 @@
 #include "uart.h"
 #include "sbi.h"
 #include "proc.h"
+#include "timer.h"
 
 // 手动定义标准库常量
 #ifndef NULL
@@ -44,12 +45,6 @@ static inline uint64 r_time_csr() { uint64 x; __asm__ volatile("csrr %0, time" :
 
 // 系统时钟变量
 volatile uint64_t ticks = 0;
-// 来自 timer.c 的中断计数器（用于测试）
-extern volatile int timer_interrupt_count;
-
-// 时钟中断周期（按 timebase 计数）。QEMU virt 上常见 timebase=10MHz，这里取 1e6 约 100ms
-static const uint64_t TIMER_INTERVAL = 1000000ULL;
-
 // 前向声明
 void clockintr(void);
 
@@ -161,10 +156,8 @@ int devintr() {
 // 时钟中断处理
 void clockintr() {
     ticks++;
-    timer_interrupt_count++;
-    // 设定下一次定时器（使用 sstc：stimecmp = time + interval）
-    // uint64_t now = r_time_csr();
-    // w_stimecmp(now + TIMER_INTERVAL);
+    timer_interrupt(NULL);
+    timer_schedule_next_tick();
     // 维护时间片：如果当前有进程，递减并设置 need_resched
     if (current && current->state == PROC_RUNNING) {
         if (current->time_slice > 0) {
@@ -235,5 +228,4 @@ void kerneltrap(void) {
     printf("            sepc=%p stval=%p\n", sepc, stval);
     panic("kerneltrap");
 }
-
 

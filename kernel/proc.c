@@ -1,13 +1,23 @@
 #include "proc.h"
 #include "uart.h"
 #include "pmm.h"
+#include "spinlock.h"
+#include "timer.h"
 
 extern int printf(char *fmt, ...);
+extern void panic(char *s);
+extern volatile uint64_t ticks;
 
 struct proc proc_table[NPROC];
 struct proc *current = 0;
 // 调度器自身的上下文，用于保存 scheduler 的寄存器
 static struct context sched_ctx;
+static struct spinlock proc_lock;
+
+#define NQUEUE 3
+static const int queue_slices[NQUEUE] = {2, 4, 8};
+static const uint64 AGING_INTERVAL = 50;
+static int queue_cursor[NQUEUE] = {0, 0, 0};
 
 static int next_pid = 1;
 
@@ -28,29 +38,71 @@ void proc_init(void) {
         proc_table[i].need_resched = 0;
         proc_table[i].tf = 0;
         proc_table[i].pagetable = 0;
+        proc_table[i].qlevel = 0;
+        proc_table[i].last_run_tick = 0;
+        proc_table[i].last_ready_tick = 0;
+        proc_table[i].parent = 0;
+        proc_table[i].child_count = 0;
+        proc_table[i].exit_status = 0;
         for (int j = 0; j < 16; j++) proc_table[i].name[j] = 0;
     }
+    initlock(&proc_lock, "proc_table");
 }
 
-struct proc* allocproc(void) {
+struct proc* alloc_process(void) {
+    struct proc *p = 0;
+    acquire(&proc_lock);
     for (int i = 0; i < NPROC; i++) {
         if (proc_table[i].state == PROC_UNUSED) {
-            struct proc *p = &proc_table[i];
+            p = &proc_table[i];
             p->state = PROC_EMBRYO;
             p->pid = next_pid++;
-            // 分配内核栈
-            void *page = alloc_page();
-            if (!page) {
-                p->state = PROC_UNUSED;
-                return 0;
-            }
-            p->kstack = (uint64)page + KSTACK_SIZE; // 栈向下生长，sp 指向页末
-            p->time_slice = 5;
-            p->need_resched = 0;
-            return p;
+            break;
         }
     }
-    return 0;
+    release(&proc_lock);
+    if (!p) return 0;
+    void *page = alloc_page();
+    if (!page) {
+        acquire(&proc_lock);
+        p->state = PROC_UNUSED;
+        release(&proc_lock);
+        return 0;
+    }
+    p->kstack = (uint64)page + KSTACK_SIZE;
+    p->qlevel = 0;
+    p->time_slice = queue_slices[p->qlevel];
+    p->need_resched = 0;
+    p->last_run_tick = ticks;
+    p->last_ready_tick = ticks;
+    p->parent = 0;
+    p->child_count = 0;
+    p->exit_status = 0;
+    return p;
+}
+
+void free_process(struct proc *p) {
+    if (!p) return;
+    if (p->kstack) {
+        free_page((void*)(p->kstack - KSTACK_SIZE));
+        p->kstack = 0;
+    }
+    if (p->parent) {
+        p->parent->child_count--;
+        if (p->parent->child_count < 0) p->parent->child_count = 0;
+    }
+    p->pid = 0;
+    p->state = PROC_UNUSED;
+    p->time_slice = 0;
+    p->need_resched = 0;
+    p->chan = 0;
+    p->qlevel = 0;
+    p->last_run_tick = 0;
+    p->last_ready_tick = 0;
+    p->parent = 0;
+    p->child_count = 0;
+    p->exit_status = 0;
+    for (int j = 0; j < 16; j++) p->name[j] = 0;
 }
 
 // 内核进程的启动桩：从 s0 寄存器读取参数指针，调用 fn(arg) 后进入 sched
@@ -64,13 +116,12 @@ static void kproc_start_trampoline(void) {
     void *arg = a->arg;
     // 调用用户函数
     fn(arg);
-    // 运行结束，进入僵尸状态并调度
-    current->state = PROC_ZOMBIE;
-    sched();
+    // 运行结束，调用统一退出路径
+    exit_process(0);
 }
 
 int kproc_create(void (*fn)(void *), void *arg, const char *name) {
-    struct proc *p = allocproc();
+    struct proc *p = alloc_process();
     if (!p) return -1;
     // 栈的范围：从 (p->kstack - KSTACK_SIZE) 到 p->kstack
     // 栈向下生长，栈顶是 p->kstack（高地址）
@@ -88,8 +139,22 @@ int kproc_create(void (*fn)(void *), void *arg, const char *name) {
     p->ctx.s0 = (uint64)a;  // 通过 s0 传递参数指针
     // 名称
     int i=0; for (; i<15 && name && name[i]; i++) p->name[i]=name[i]; p->name[i]=0;
+    acquire(&proc_lock);
     p->state = PROC_RUNNABLE;
+    p->last_ready_tick = ticks;
+    p->parent = current;
+    if (current) current->child_count++;
+    release(&proc_lock);
     return p->pid;
+}
+
+static void proc_entry_wrapper(void *arg) {
+    void (*fn)(void) = (void (*)(void))arg;
+    fn();
+}
+
+int create_process(void (*entry)(void)) {
+    return kproc_create(proc_entry_wrapper, (void*)entry, "proc");
 }
 
 void sched(void) {
@@ -101,65 +166,153 @@ void sched(void) {
 
 void yield(void) {
     if (!current) return;
+    acquire(&proc_lock);
     current->state = PROC_RUNNABLE;
     current->need_resched = 0;
+    current->last_ready_tick = ticks;
+    release(&proc_lock);
     sched();
 }
 
-// 轮转调度器：在一个专用内核上下文中循环挑选 RUNNABLE 进程运行
+void exit_process(int status) {
+    acquire(&proc_lock);
+    current->exit_status = status;
+    // 重新父子关系：孤儿交给 0（无父）
+    for (int i = 0; i < NPROC; i++) {
+        struct proc *p = &proc_table[i];
+        if (p->parent == current) {
+            p->parent = 0;
+        }
+    }
+    current->child_count = 0;
+    current->state = PROC_ZOMBIE;
+    if (current->parent) {
+        wakeup(current->parent);
+    }
+    release(&proc_lock);
+    sched();
+    panic("exit_process returned");
+}
+
+static void promote_waiting_procs(void) {
+    uint64 now = ticks;
+    for (int i = 0; i < NPROC; i++) {
+        struct proc *p = &proc_table[i];
+        if (p->state != PROC_RUNNABLE) continue;
+        if (p->qlevel > 0 && (now - p->last_ready_tick) >= AGING_INTERVAL) {
+            p->qlevel--;
+            p->time_slice = queue_slices[p->qlevel];
+            p->last_ready_tick = now;
+        }
+    }
+}
+
+// 多级反馈队列调度器
 void scheduler(void) {
     while (1) {
-        for (int i = 0; i < NPROC; i++) {
-            struct proc *p = &proc_table[i];
-            if (p->state != PROC_RUNNABLE) continue;
-            // 切换到 p
-            current = p;
-            p->state = PROC_RUNNING;
-            p->time_slice = 5;
-            swtch(&sched_ctx, &p->ctx); // 从调度器切到进程
-            // 返回到这里表示该进程调用了 sched/yield 或结束
-            if (p->state == PROC_ZOMBIE) {
-                if (p->kstack) free_page((void*)(p->kstack - KSTACK_SIZE));
-                p->pid = 0;
-                p->state = PROC_UNUSED;
-                p->kstack = 0;
+        acquire(&proc_lock);
+        promote_waiting_procs();
+        int scheduled = 0;
+        for (int level = 0; level < NQUEUE && !scheduled; level++) {
+            int start = queue_cursor[level];
+            for (int offset = 0; offset < NPROC; offset++) {
+                int idx = (start + offset) % NPROC;
+                struct proc *p = &proc_table[idx];
+                if (p->state != PROC_RUNNABLE || p->qlevel != level) continue;
+                current = p;
+                p->state = PROC_RUNNING;
+                p->time_slice = queue_slices[p->qlevel];
+                p->last_run_tick = ticks;
+                release(&proc_lock);
+                swtch(&sched_ctx, &p->ctx);
+                acquire(&proc_lock);
+                queue_cursor[level] = (idx + 1) % NPROC;
+                if (p->state == PROC_ZOMBIE) {
+                    if (p->parent) {
+                        wakeup(p->parent);
+                    } else {
+                        free_process(p);
+                    }
+                } else if (p->state == PROC_RUNNABLE && p->time_slice <= 0) {
+                    if (p->qlevel < NQUEUE - 1) {
+                        p->qlevel++;
+                    }
+                    p->time_slice = queue_slices[p->qlevel];
+                    p->last_ready_tick = ticks;
+                }
+                scheduled = 1;
+                break;
             }
         }
-        // 可加入 wfi 省电
+        release(&proc_lock);
         __asm__ volatile("wfi");
     }
 }
 
-// ---- sleep/wakeup 简化实现（禁中断防止 lost wakeup） ----
-static inline uint64 r_sstatus_local() { uint64 x; __asm__ volatile("csrr %0, sstatus" : "=r" (x)); return x; }
-static inline void w_sstatus_local(uint64 x) { __asm__ volatile("csrw sstatus, %0" :: "r" (x)); }
-#define SSTATUS_SIE (1UL<<1)
-
-static inline int intr_get_local() { return (r_sstatus_local() & SSTATUS_SIE) != 0; }
-static inline void intr_on_local() { w_sstatus_local(r_sstatus_local() | SSTATUS_SIE); }
-static inline void intr_off_local() { w_sstatus_local(r_sstatus_local() & ~SSTATUS_SIE); }
-
-void sleep(void *chan) {
-    if (!current) return;
-    int int_was_on = intr_get_local();
-    intr_off_local();
+void sleep(void *chan, struct spinlock *lk) {
+    if (!current || lk == 0) return;
+    acquire(&proc_lock);
+    release(lk);
     current->chan = chan;
     current->state = PROC_SLEEPING;
+    release(&proc_lock);
     sched();
+    acquire(&proc_lock);
     current->chan = 0;
-    if (int_was_on) intr_on_local();
+    release(&proc_lock);
+    acquire(lk);
 }
 
 void wakeup(void *chan) {
-    int int_was_on = intr_get_local();
-    intr_off_local();
+    acquire(&proc_lock);
     for (int i = 0; i < NPROC; i++) {
         struct proc *p = &proc_table[i];
         if (p->state == PROC_SLEEPING && p->chan == chan) {
             p->state = PROC_RUNNABLE;
+            p->last_ready_tick = ticks;
         }
     }
-    if (int_was_on) intr_on_local();
+    release(&proc_lock);
 }
 
+int wait_process(int *status) {
+    acquire(&proc_lock);
+    for (;;) {
+        int havekids = 0;
+        for (int i = 0; i < NPROC; i++) {
+            struct proc *p = &proc_table[i];
+            if (p->parent != current) continue;
+            havekids = 1;
+            if (p->state == PROC_ZOMBIE) {
+                int pid = p->pid;
+                if (status) *status = p->exit_status;
+                free_process(p);
+                release(&proc_lock);
+                return pid;
+            }
+        }
+        if (!havekids) {
+            release(&proc_lock);
+            return -1;
+        }
+        sleep(current, &proc_lock);
+    }
+}
 
+void debug_proc_table(void) {
+    static const char *state_names[] = {
+        "UNUSED", "EMBRYO", "RUNNABLE", "RUNNING", "SLEEPING", "ZOMBIE"
+    };
+    acquire(&proc_lock);
+    printf("=== Process Table ===\n");
+    for (int i = 0; i < NPROC; i++) {
+        struct proc *p = &proc_table[i];
+        if (p->state == PROC_UNUSED) continue;
+        const char *name = (p->name[0] ? p->name : "(noname)");
+        const char *state = (p->state >= 0 && p->state <= PROC_ZOMBIE)
+            ? state_names[p->state] : "UNKNOWN";
+        printf("PID:%d State:%s Q:%d Slice:%d Name:%s\n",
+               p->pid, state, p->qlevel, p->time_slice, name);
+    }
+    release(&proc_lock);
+}

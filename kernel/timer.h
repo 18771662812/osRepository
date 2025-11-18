@@ -9,6 +9,9 @@ void timer_init(void);
 // 定时器中断处理函数
 void timer_interrupt(void *arg);
 
+// 重新装载下一次时钟中断
+void timer_schedule_next_tick(void);
+
 // 获取系统节拍数
 uint64_t get_sys_ticks(void);
 
