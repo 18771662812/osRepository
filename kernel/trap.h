@@ -27,6 +27,7 @@ void handle_irq(int irq);
 
 // 用户态陷阱处理入口
 void usertrap(void);
+void usertrapret(void);
 
 // 内核态陷阱处理入口  
 void kerneltrap(void);

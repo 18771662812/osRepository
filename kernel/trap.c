@@ -2,7 +2,9 @@
 #include "uart.h"
 #include "sbi.h"
 #include "proc.h"
+#include "syscall.h"
 #include "timer.h"
+#include "vm.h"
 
 // 手动定义标准库常量
 #ifndef NULL
@@ -11,6 +13,13 @@
 
 extern int printf(char *fmt, ...);
 extern void panic(char *s);
+extern char trampoline[], uservec[], userret[];
+
+#define SSTATUS_SIE (1UL << 1)
+#define SSTATUS_SPIE (1UL << 5)
+#define SSTATUS_SPP (1UL << 8)
+
+void usertrapret(void);
 
 // xv6风格的CSR寄存器操作
 static inline uint64 r_scause() {
@@ -37,6 +46,40 @@ static inline void w_sepc(uint64 x) {
 
 static inline void w_sstatus(uint64 x) {
     __asm__ volatile("csrw sstatus, %0" : : "r" (x));
+}
+
+static inline uint64 r_sstatus() {
+    uint64 x;
+    __asm__ volatile("csrr %0, sstatus" : "=r"(x));
+    return x;
+}
+
+static inline void w_stvec(uint64 x) {
+    __asm__ volatile("csrw stvec, %0" : : "r"(x));
+}
+
+static inline uint64 r_satp_csr() {
+    uint64 x;
+    __asm__ volatile("csrr %0, satp" : "=r"(x));
+    return x;
+}
+
+static inline void intr_on(void) {
+    w_sstatus(r_sstatus() | SSTATUS_SIE);
+}
+
+static inline void intr_off(void) {
+    w_sstatus(r_sstatus() & ~SSTATUS_SIE);
+}
+
+static inline int intr_get(void) {
+    return (r_sstatus() & SSTATUS_SIE) != 0;
+}
+
+static inline uint64 r_tp_csr(void) {
+    uint64 x;
+    __asm__ volatile("mv %0, tp" : "=r"(x));
+    return x;
 }
 
 // S 态计时相关 CSR 助手（与 start.c 启用 sstc 保持一致）
@@ -176,7 +219,7 @@ void trap_init(void) {
     
     // 设置监督态陷阱入口到汇编向量 kernelvec
     extern void kernelvec(void);
-    __asm__ volatile("csrw stvec, %0" :: "r" ((uint64)kernelvec));
+    w_stvec((uint64)kernelvec);
 
     // 打开 SIE 位并允许 S-定时器中断
     uint64 mstatus;
@@ -193,39 +236,96 @@ void trap_init(void) {
 
 // 用户态陷阱处理
 void usertrap(void) {
-    uint64 scause = r_scause();
-    uint64 sepc = r_sepc();
-    uint64 stval = r_stval();
-
-    // 最高位=1 表示中断，统一交由设备中断分发
-    if (scause >> 63) {
-        if (devintr() != 0) return;
+    if ((r_sstatus() & SSTATUS_SPP) != 0) {
+        panic("usertrap: not from user mode");
     }
 
-    printf("usertrap: unexpected scause %p pid=%d\n", scause, 0);
-    printf("            sepc=%p stval=%p\n", sepc, stval);
-    panic("usertrap");
+    // 切换到 kernelvec
+    extern void kernelvec(void);
+    w_stvec((uint64)kernelvec);
+
+    struct proc *p = current;
+    if (!p) {
+        panic("usertrap: current is null");
+    }
+
+    p->tf->epc = r_sepc();
+
+    uint64 scause = r_scause();
+    int which_dev = 0;
+
+    if (scause == 8) {
+        // ecall from U
+        p->tf->epc += 4;
+        intr_on();
+        syscall_dispatch();
+    } else if ((scause >> 63) && (which_dev = devintr()) != 0) {
+        // handled in devintr
+    } else {
+        printf("usertrap: unexpected scause %p pid=%d\n", scause, p->pid);
+        printf("            sepc=%p stval=%p\n", p->tf->epc, r_stval());
+        exit_process(-1);
+    }
+
+    // 时钟中断触发调度
+    if (which_dev == 2) {
+        yield();
+    }
+
+    usertrapret();
+}
+
+void usertrapret(void) {
+    struct proc *p = current;
+    if (!p) panic("usertrapret no proc");
+
+    intr_off();
+
+    uint64 trampoline_uservec = TRAMPOLINE + ((uint64)uservec - (uint64)trampoline);
+    w_stvec(trampoline_uservec);
+
+    p->tf->kernel_satp = r_satp_csr();
+    p->tf->kernel_sp = p->kstack;
+    p->tf->kernel_trap = (uint64)usertrap;
+    p->tf->kernel_hartid = r_tp_csr();
+
+    uint64 x = r_sstatus();
+    x &= ~SSTATUS_SPP;
+    x |= SSTATUS_SPIE;
+    w_sstatus(x);
+
+    w_sepc(p->tf->epc);
+
+    uint64 satp = MAKE_SATP(p->pagetable);
+    uint64 trampoline_userret = TRAMPOLINE + ((uint64)userret - (uint64)trampoline);
+    void (*userret_fn)(uint64) = (void (*)(uint64))trampoline_userret;
+    userret_fn(satp);
 }
 
 // 内核态陷阱处理
 void kerneltrap(void) {
-    uint64 scause = r_scause();
     uint64 sepc = r_sepc();
-    uint64 stval = r_stval();
+    uint64 sstatus = r_sstatus();
+    uint64 scause = r_scause();
 
-    // 最高位=1 表示中断，统一交由设备中断分发
-    if (scause >> 63) {
-        if (devintr() != 0) {
-            // 如果是时钟中断导致需要调度，则在内核可切换点执行 yield
-            if (current && current->need_resched) {
-                yield();
-            }
-            return;
-        }
+    if ((sstatus & SSTATUS_SPP) == 0) {
+        panic("kerneltrap: not from supervisor");
+    }
+    if (intr_get()) {
+        panic("kerneltrap: interrupts enabled");
     }
 
-    printf("kerneltrap: unexpected scause %p\n", scause);
-    printf("            sepc=%p stval=%p\n", sepc, stval);
-    panic("kerneltrap");
-}
+    int which_dev = devintr();
+    if (which_dev == 0) {
+        printf("kerneltrap: unexpected scause %p\n", scause);
+        printf("            sepc=%p stval=%p\n", sepc, r_stval());
+        panic("kerneltrap");
+    }
 
+    if (which_dev == 2 && current && current->state == PROC_RUNNING) {
+        yield();
+    }
+
+    w_sepc(sepc);
+    w_sstatus(sstatus);
+}

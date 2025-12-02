@@ -2,6 +2,7 @@
 #include "pmm.h"
 
 extern int printf(char *fmt, ...);
+extern char trampoline[];
 
 // Global kernel page table
 pagetable_t kernel_pagetable = 0;
@@ -10,6 +11,13 @@ pagetable_t kernel_pagetable = 0;
 static void *k_memset(void *dst, int c, uint64 n) {
 	unsigned char *p = (unsigned char*)dst;
 	for (uint64 i = 0; i < n; i++) p[i] = (unsigned char)c;
+	return dst;
+}
+
+static void *k_memcpy(void *dst, const void *src, uint64 n) {
+	unsigned char *d = (unsigned char*)dst;
+	const unsigned char *s = (const unsigned char*)src;
+	for (uint64 i = 0; i < n; i++) d[i] = s[i];
 	return dst;
 }
 
@@ -93,6 +101,122 @@ void destroy_pagetable(pagetable_t pt) {
 	free_table_recursive((uint64)pt, 2);
 }
 
+pagetable_t uvmcreate(void) {
+	return create_pagetable();
+}
+
+uint64 uvmalloc(pagetable_t pt, uint64 oldsz, uint64 newsz, int perm) {
+	if (newsz < oldsz) return oldsz;
+	uint64 start = PGROUNDUP(oldsz);
+	uint64 a = start;
+	for (; a < newsz; a += PGSIZE) {
+		void *mem = alloc_page();
+		if (!mem) {
+			uvmunmap(pt, start, a - start);
+			return 0;
+		}
+		map_page(pt, a, (uint64)mem, perm | PTE_U);
+	}
+	return newsz;
+}
+
+uint64 uvmdealloc(pagetable_t pt, uint64 oldsz, uint64 newsz) {
+	if (newsz >= oldsz) return oldsz;
+	uint64 newa = PGROUNDUP(newsz);
+	if (newa < PGROUNDUP(oldsz)) {
+		uvmunmap(pt, newa, PGROUNDUP(oldsz) - newa);
+	}
+	return newsz;
+}
+
+void uvmunmap(pagetable_t pt, uint64 va, uint64 size) {
+	for (uint64 a = va; a < va + size; a += PGSIZE) {
+		pte_t *pte = walk_lookup(pt, a);
+		if (!pte || !(*pte & PTE_V)) continue;
+		uint64 pa = PA_FROM_PTE(*pte);
+		free_page((void*)pa);
+		*pte = 0;
+	}
+}
+
+void free_user_pagetable(pagetable_t pt) {
+	destroy_pagetable(pt);
+}
+
+static int copyin_internal(pagetable_t pt, char *dst, uint64 srcva, uint64 len, int instr) {
+	uint64 n, pa;
+	while (len > 0) {
+		pte_t *pte = walk_lookup(pt, srcva);
+		if (!pte || !(*pte & PTE_V) || !(*pte & PTE_U)) return -1;
+		pa = PA_FROM_PTE(*pte);
+		uint64 offset = srcva & (PGSIZE-1);
+		uint64 tocopy = PGSIZE - offset;
+		if (tocopy > len) tocopy = len;
+		char *p = (char*)(pa + offset);
+		for (n = 0; n < tocopy; n++) {
+			if (instr && p[n] == 0) {
+				dst[n] = 0;
+				return 0;
+			}
+			dst[n] = p[n];
+		}
+		if (instr) dst += n;
+		srcva += tocopy;
+		dst += tocopy;
+		len -= tocopy;
+		if (instr) return -1;
+	}
+	return 0;
+}
+
+int copyin(pagetable_t pt, char *dst, uint64 srcva, uint64 len) {
+	return copyin_internal(pt, dst, srcva, len, 0);
+}
+
+int copyinstr(pagetable_t pt, char *dst, uint64 srcva, int max) {
+	return copyin_internal(pt, dst, srcva, max, 1);
+}
+
+int copyout(pagetable_t pt, uint64 dstva, const char *src, uint64 len) {
+	while (len > 0) {
+		pte_t *pte = walk_lookup(pt, dstva);
+		if (!pte || !(*pte & PTE_V) || !(*pte & PTE_U)) return -1;
+		uint64 pa = PA_FROM_PTE(*pte);
+		uint64 offset = dstva & (PGSIZE-1);
+		uint64 tocopy = PGSIZE - offset;
+		if (tocopy > len) tocopy = len;
+		char *p = (char*)(pa + offset);
+		for (uint64 n = 0; n < tocopy; n++) p[n] = src[n];
+		dstva += tocopy;
+		src += tocopy;
+		len -= tocopy;
+	}
+	return 0;
+}
+
+int uvmcopy(pagetable_t old, pagetable_t newpt, uint64 sz) {
+	for (uint64 i = 0; i < sz; i += PGSIZE) {
+		pte_t *pte = walk_lookup(old, i);
+		if (!pte || !(*pte & PTE_V)) {
+			return -1;
+		}
+		uint64 pa = PA_FROM_PTE(*pte);
+		int flags = PTE_FLAGS(*pte) & (PTE_R | PTE_W | PTE_X | PTE_U);
+		void *mem = alloc_page();
+		if (!mem) {
+			uvmunmap(newpt, 0, i);
+			return -1;
+		}
+		k_memcpy(mem, (void*)pa, PGSIZE);
+		if (map_page(newpt, i, (uint64)mem, flags) != 0) {
+			free_page(mem);
+			uvmunmap(newpt, 0, i + PGSIZE);
+			return -1;
+		}
+	}
+	return 0;
+}
+
 // Dumpers
 static void dump_indent(int level) {
 	for (int i = 0; i < level; i++) printf("  ");
@@ -116,11 +240,9 @@ void dump_pagetable(pagetable_t pt, int level) {
 
 // Map a region of memory
 int map_region(pagetable_t pt, uint64 va, uint64 pa, uint64 size, int perm) {
-	uint64 a = va;
-	uint64 last = va + size - 1;
-	
-	for (uint64 p = a; p <= last; p += PGSIZE) {
-		uint64 pa_page = pa + (p - a);
+	for (uint64 off = 0; off < size; off += PGSIZE) {
+		uint64 p = va + off;
+		uint64 pa_page = pa + off;
 		if (map_page(pt, p, pa_page, perm) != 0) {
 			return -1;
 		}
@@ -137,26 +259,22 @@ void kvminit(void) {
 		return;
 	}
 	
-	// 2. 映射内核代码段 (R+X权限) - 简化版本
-	// 映射整个内核区域，从KERNEL_BASE开始
-	uint64 kernel_size = 0x100000; // 1MB 内核区域
-	if (map_region(kernel_pagetable, KERNEL_BASE, KERNEL_BASE, kernel_size, PTE_R | PTE_X) != 0) {
-		printf("ERROR: Failed to map kernel text!\n");
-		return;
-	}
-	
-	// 3. 映射内核数据段 (R+W权限) - 简化版本
-	// 映射数据区域，紧跟在代码段后面
-	uint64 data_start = KERNEL_BASE + kernel_size;
-	uint64 data_size = 0x100000; // 1MB 数据区域
-	if (map_region(kernel_pagetable, data_start, data_start, data_size, PTE_R | PTE_W) != 0) {
-		printf("ERROR: Failed to map kernel data!\n");
+	// 映射整个可用物理内存区域
+	uint64 mem_size = pmm_manager.mem_end - KERNEL_BASE;
+	if (map_region(kernel_pagetable, KERNEL_BASE, KERNEL_BASE, mem_size, PTE_R | PTE_W | PTE_X) != 0) {
+		printf("ERROR: Failed to map kernel memory!\n");
 		return;
 	}
 	
 	// 4. 映射设备内存 (UART等)
 	if (map_region(kernel_pagetable, UART0_BASE, UART0_BASE, UART0_SIZE, PTE_R | PTE_W) != 0) {
 		printf("ERROR: Failed to map UART!\n");
+		return;
+	}
+
+	// 5. 映射 trampoline（供内核/用户共享）
+	if (map_region(kernel_pagetable, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X) != 0) {
+		printf("ERROR: Failed to map trampoline!\n");
 		return;
 	}
 	

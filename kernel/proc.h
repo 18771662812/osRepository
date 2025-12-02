@@ -4,6 +4,7 @@
 #include "types.h"
 #include "pmm.h"
 #include "spinlock.h"
+#include "file.h"
 
 #define NPROC 64
 #define KSTACK_SIZE KERNEL_STACK_SIZE
@@ -42,6 +43,7 @@ struct trapframe {
     uint64 kernel_sp;
     uint64 kernel_trap;
     uint64 epc;
+    uint64 kernel_hartid;
     uint64 ra, sp;
     uint64 gp, tp;
     uint64 t0, t1, t2;
@@ -73,7 +75,9 @@ struct proc {
 
     // 用户态相关（占位）
     struct trapframe *tf;
-    uint64 pagetable; // satp 值或页表根指针，占位
+    uint64 pagetable; // 用户页表根（satp中的ppn<<12）
+    uint64 sz;        // 用户内存大小
+    struct file *ofile[NOFILE];
 };
 
 extern struct proc proc_table[NPROC];
@@ -86,9 +90,14 @@ void free_process(struct proc *p);
 int create_process(void (*entry)(void));
 void exit_process(int status);
 int wait_process(int *status);
+int kill_process(int pid);
+struct proc* myproc(void);
 void scheduler(void);
 void yield(void);
 void sched(void);
+void userinit(void);
+int grow_process(int n);
+int fork_user_process(void);
 
 // 同步原语：基于通道的睡眠/唤醒（简化版，禁中断避免 lost wakeup）
 void sleep(void *chan, struct spinlock *lk);

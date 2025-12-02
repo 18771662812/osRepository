@@ -3,6 +3,8 @@
 #include "pmm.h"
 #include "spinlock.h"
 #include "timer.h"
+#include "trap.h"
+#include "vm.h"
 
 extern int printf(char *fmt, ...);
 extern void panic(char *s);
@@ -13,6 +15,11 @@ struct proc *current = 0;
 // 调度器自身的上下文，用于保存 scheduler 的寄存器
 static struct context sched_ctx;
 static struct spinlock proc_lock;
+extern char trampoline[];
+extern char _binary_user_test_basic_bin_start[];
+extern char _binary_user_test_basic_bin_end[];
+static pagetable_t proc_pagetable(struct proc *p);
+static void proc_freepagetable(pagetable_t pt, uint64 sz);
 
 #define NQUEUE 3
 static const int queue_slices[NQUEUE] = {2, 4, 8};
@@ -44,6 +51,10 @@ void proc_init(void) {
         proc_table[i].parent = 0;
         proc_table[i].child_count = 0;
         proc_table[i].exit_status = 0;
+        proc_table[i].tf = 0;
+        proc_table[i].pagetable = 0;
+        proc_table[i].sz = 0;
+        for (int k = 0; k < NOFILE; k++) proc_table[i].ofile[k] = 0;
         for (int j = 0; j < 16; j++) proc_table[i].name[j] = 0;
     }
     initlock(&proc_lock, "proc_table");
@@ -78,7 +89,40 @@ struct proc* alloc_process(void) {
     p->parent = 0;
     p->child_count = 0;
     p->exit_status = 0;
+    p->sz = 0;
+    p->tf = 0;
+    p->pagetable = 0;
+    for (int k = 0; k < NOFILE; k++) p->ofile[k] = 0;
+    p->ofile[1] = &cons_file;
+    p->ofile[2] = &cons_file;
+    p->tf = 0;
+    p->pagetable = 0;
+    p->sz = 0;
     return p;
+}
+
+static pagetable_t proc_pagetable(struct proc *p) {
+    pagetable_t pt = uvmcreate();
+    if (!pt) return 0;
+    if (map_page(pt, TRAMPOLINE, (uint64)trampoline, PTE_R | PTE_X) != 0) {
+        free_user_pagetable(pt);
+        return 0;
+    }
+    if (p->tf) {
+        if (map_page(pt, TRAPFRAME, (uint64)p->tf, PTE_R | PTE_W) != 0) {
+            free_user_pagetable(pt);
+            return 0;
+        }
+    }
+    return pt;
+}
+
+static void proc_freepagetable(pagetable_t pt, uint64 sz) {
+    if (!pt) return;
+    if (sz > 0) {
+        uvmunmap(pt, 0, PGROUNDUP(sz));
+    }
+    free_user_pagetable(pt);
 }
 
 void free_process(struct proc *p) {
@@ -91,6 +135,14 @@ void free_process(struct proc *p) {
         p->parent->child_count--;
         if (p->parent->child_count < 0) p->parent->child_count = 0;
     }
+    if (p->pagetable) {
+        proc_freepagetable((pagetable_t)p->pagetable, p->sz);
+        p->pagetable = 0;
+    }
+    if (p->tf) {
+        free_page(p->tf);
+        p->tf = 0;
+    }
     p->pid = 0;
     p->state = PROC_UNUSED;
     p->time_slice = 0;
@@ -102,7 +154,41 @@ void free_process(struct proc *p) {
     p->parent = 0;
     p->child_count = 0;
     p->exit_status = 0;
+    p->sz = 0;
+    for (int k = 0; k < NOFILE; k++) p->ofile[k] = 0;
     for (int j = 0; j < 16; j++) p->name[j] = 0;
+}
+
+static struct proc* alloc_user_proc(void) {
+    struct proc *p = alloc_process();
+    if (!p) return 0;
+    p->tf = (struct trapframe*)alloc_page();
+    if (!p->tf) {
+        free_process(p);
+        return 0;
+    }
+    p->pagetable = proc_pagetable(p);
+    if (!p->pagetable) {
+        free_process(p);
+        return 0;
+    }
+    context_init(&p->ctx, p->kstack, (uint64)usertrapret);
+    return p;
+}
+
+static int load_program(struct proc *p, char *binary, uint64 size) {
+    uint64 newsz = uvmalloc((pagetable_t)p->pagetable, 0, PGROUNDUP(size), PTE_R | PTE_W | PTE_X);
+    if (!newsz) return -1;
+    if (copyout((pagetable_t)p->pagetable, 0, binary, size) < 0) {
+        return -1;
+    }
+    uint64 stack_top = PGROUNDUP(newsz);
+    newsz = uvmalloc((pagetable_t)p->pagetable, stack_top, stack_top + 2 * PGSIZE, PTE_R | PTE_W);
+    if (!newsz) return -1;
+    p->sz = newsz;
+    p->tf->epc = 0;
+    p->tf->sp = newsz;
+    return 0;
 }
 
 // 内核进程的启动桩：从 s0 寄存器读取参数指针，调用 fn(arg) 后进入 sched
@@ -148,6 +234,26 @@ int kproc_create(void (*fn)(void *), void *arg, const char *name) {
     return p->pid;
 }
 
+int kill_process(int pid) {
+    acquire(&proc_lock);
+    for (int i = 0; i < NPROC; i++) {
+        struct proc *p = &proc_table[i];
+        if (p->pid != pid || p->state == PROC_UNUSED) continue;
+        if (p == current) {
+            release(&proc_lock);
+            exit_process(-1);
+            return 0; // 不会返回
+        }
+        p->exit_status = -1;
+        p->state = PROC_ZOMBIE;
+        if (p->parent) wakeup(p->parent);
+        release(&proc_lock);
+        return 0;
+    }
+    release(&proc_lock);
+    return -1;
+}
+
 static void proc_entry_wrapper(void *arg) {
     void (*fn)(void) = (void (*)(void))arg;
     fn();
@@ -155,6 +261,64 @@ static void proc_entry_wrapper(void *arg) {
 
 int create_process(void (*entry)(void)) {
     return kproc_create(proc_entry_wrapper, (void*)entry, "proc");
+}
+
+void userinit(void) {
+    struct proc *p = alloc_user_proc();
+    if (!p) panic("userinit: alloc");
+    uint64 sz = (uint64)(_binary_user_test_basic_bin_end - _binary_user_test_basic_bin_start);
+    if (load_program(p, _binary_user_test_basic_bin_start, sz) < 0) {
+        panic("userinit: load");
+    }
+    int i = 0;
+    const char *name = "init";
+    for (; i < 15 && name[i]; i++) p->name[i] = name[i];
+    p->name[i] = 0;
+    acquire(&proc_lock);
+    p->state = PROC_RUNNABLE;
+    p->last_ready_tick = ticks;
+    release(&proc_lock);
+    printf("userinit ready pid=%d\n", p->pid);
+}
+
+int fork_user_process(void) {
+    if (!current) return -1;
+    struct proc *np = alloc_user_proc();
+    if (!np) return -1;
+    if (uvmcopy((pagetable_t)current->pagetable, (pagetable_t)np->pagetable, current->sz) < 0) {
+        free_process(np);
+        return -1;
+    }
+    np->sz = current->sz;
+    *(np->tf) = *(current->tf);
+    np->tf->a0 = 0;
+    for (int i = 0; i < NOFILE; i++) {
+        np->ofile[i] = current->ofile[i];
+    }
+    acquire(&proc_lock);
+    np->parent = current;
+    current->child_count++;
+    np->state = PROC_RUNNABLE;
+    np->last_ready_tick = ticks;
+    release(&proc_lock);
+    return np->pid;
+}
+
+int grow_process(int n) {
+    if (!current || !current->pagetable) return -1;
+    uint64 sz = current->sz;
+    uint64 newsz = sz;
+    if (n > 0) {
+        uint64 target = sz + (uint64)n;
+        newsz = uvmalloc((pagetable_t)current->pagetable, sz, target, PTE_R | PTE_W | PTE_X);
+        if (!newsz) return -1;
+    } else if (n < 0) {
+        uint64 dec = (uint64)(-n);
+        uint64 target = (dec > sz) ? 0 : sz - dec;
+        newsz = uvmdealloc((pagetable_t)current->pagetable, sz, target);
+    }
+    current->sz = newsz;
+    return (int)sz;
 }
 
 void sched(void) {
@@ -223,6 +387,7 @@ void scheduler(void) {
                 p->state = PROC_RUNNING;
                 p->time_slice = queue_slices[p->qlevel];
                 p->last_run_tick = ticks;
+                printf("schedule pid=%d\n", p->pid);
                 release(&proc_lock);
                 swtch(&sched_ctx, &p->ctx);
                 acquire(&proc_lock);
