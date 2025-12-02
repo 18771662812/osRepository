@@ -17,7 +17,7 @@ LDFLAGS = -T kernel/kernel.ld
 ASM_SRCS = kernel/entry.S kernel/kernelvec.S kernel/swtch.S kernel/trampoline.S
 C_SRCS = kernel/start.c kernel/main.c kernel/uart.c kernel/printf.c kernel/console.c kernel/pmm.c kernel/vm.c \
          kernel/trap.c kernel/sbi.c kernel/timer.c kernel/proc.c kernel/spinlock.c kernel/semaphore.c kernel/syscall.c \
-         kernel/file.c
+         kernel/file.c kernel/sleeplock.c kernel/bio.c kernel/log.c kernel/inode.c kernel/ramdisk.c
 OBJS = $(ASM_SRCS:.S=.o) $(C_SRCS:.c=.o)
 
 USER_OBJS = user/crt0.o user/test_basic.o user/printf.o user/ulib.o user/usys.o

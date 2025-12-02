@@ -28,6 +28,19 @@ static int queue_cursor[NQUEUE] = {0, 0, 0};
 
 static int next_pid = 1;
 
+static void safestrcpy(char *dst, const char *src, int n) {
+    if (!dst || n <= 0) return;
+    if (!src) {
+        dst[0] = 0;
+        return;
+    }
+    int i = 0;
+    for (; i < n - 1 && src[i]; i++) {
+        dst[i] = src[i];
+    }
+    dst[i] = 0;
+}
+
 static void context_init(struct context *c, uint64 sp, uint64 ra_entry) {
     c->ra = ra_entry;
     c->sp = sp;
@@ -36,7 +49,6 @@ static void context_init(struct context *c, uint64 sp, uint64 ra_entry) {
 }
 
 void proc_init(void) {
-    printf("proc_init\n");
     for (int i = 0; i < NPROC; i++) {
         proc_table[i].pid = 0;
         proc_table[i].state = PROC_UNUSED;
@@ -282,25 +294,33 @@ void userinit(void) {
 }
 
 int fork_user_process(void) {
-    if (!current) return -1;
+    struct proc *p = current;
+    if (!p) return -1;
+
     struct proc *np = alloc_user_proc();
     if (!np) return -1;
-    if (uvmcopy((pagetable_t)current->pagetable, (pagetable_t)np->pagetable, current->sz) < 0) {
+
+    if (uvmcopy((pagetable_t)p->pagetable, (pagetable_t)np->pagetable, p->sz) < 0) {
         free_process(np);
         return -1;
     }
-    np->sz = current->sz;
-    *(np->tf) = *(current->tf);
+
+    np->sz = p->sz;
+    *(np->tf) = *(p->tf);
     np->tf->a0 = 0;
+
     for (int i = 0; i < NOFILE; i++) {
-        np->ofile[i] = current->ofile[i];
+        np->ofile[i] = p->ofile[i];
     }
+    safestrcpy(np->name, p->name, sizeof(np->name));
+
     acquire(&proc_lock);
-    np->parent = current;
-    current->child_count++;
+    np->parent = p;
+    p->child_count++;
     np->state = PROC_RUNNABLE;
     np->last_ready_tick = ticks;
     release(&proc_lock);
+
     return np->pid;
 }
 
@@ -416,20 +436,27 @@ void scheduler(void) {
 
 void sleep(void *chan, struct spinlock *lk) {
     if (!current || lk == 0) return;
-    acquire(&proc_lock);
-    release(lk);
+    if (lk != &proc_lock) {
+        acquire(&proc_lock);
+        release(lk);
+    }
     current->chan = chan;
     current->state = PROC_SLEEPING;
     release(&proc_lock);
     sched();
     acquire(&proc_lock);
     current->chan = 0;
-    release(&proc_lock);
-    acquire(lk);
+    if (lk != &proc_lock) {
+        release(&proc_lock);
+        acquire(lk);
+    }
 }
 
 void wakeup(void *chan) {
-    acquire(&proc_lock);
+    int held = holding(&proc_lock);
+    if (!held) {
+        acquire(&proc_lock);
+    }
     for (int i = 0; i < NPROC; i++) {
         struct proc *p = &proc_table[i];
         if (p->state == PROC_SLEEPING && p->chan == chan) {
@@ -437,7 +464,9 @@ void wakeup(void *chan) {
             p->last_ready_tick = ticks;
         }
     }
-    release(&proc_lock);
+    if (!held) {
+        release(&proc_lock);
+    }
 }
 
 int wait_process(int *status) {

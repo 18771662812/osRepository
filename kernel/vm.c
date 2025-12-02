@@ -278,7 +278,6 @@ void kvminit(void) {
 		return;
 	}
 	
-	printf("Kernel page table initialized successfully\n");
 }
 
 // Activate kernel page table
@@ -292,5 +291,4 @@ void kvminithart(void) {
 	w_satp(MAKE_SATP(kernel_pagetable));
 	sfence_vma();
 	
-	printf("Virtual memory enabled (Sv39 mode)\n");
 }
